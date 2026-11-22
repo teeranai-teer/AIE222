@@ -1,10 +1,11 @@
 """Rebuild expensive orders or contiguous groups of loads around a fixed plan."""
-from collections import Counter
+from bisect import bisect_right
+from collections import Counter, defaultdict
 from itertools import count
 from random import Random
-from time import time
+from time import monotonic
 
-from aiconcrete import kpis, leg, m2t, simulate, transport_cost
+from aiconcrete import TRUCK_DAY_START, WASH_MIN, kpis, leg, m2t, simulate, transport_cost
 from dispatch import dispatch
 from solver import shift_options
 
@@ -67,7 +68,7 @@ def rebuild(day, rows, changes, production, deadline, offer, seed=15, partial=Tr
 
     orders, margins, costs = priorities()
     for trial in count():
-        if not orders or time() >= deadline:
+        if not orders or monotonic() >= deadline:
             return
         whole = not partial or trial < len(orders) or trial % 3 != 0 or not rows
         if whole:
@@ -147,14 +148,14 @@ def eject(day, rows, changes, production, deadline, offer, seed):
         return [tid for tid, t in day.trucks.items() if t['size'] == streams[i]['truck_size']
                 and (t['allowed'] is None or pid in t['allowed'])]
 
-    while time() < deadline:
+    while monotonic() < deadline:
         options = sorted((prices[i][row['plant_id']] - cost + rng.uniform(-70, 70), i, pid)
                          for i, row in enumerate(rows) for pid, cost in prices[i].items()
                          if cost < prices[i][row['plant_id']] - 1)
         if not options:
             return
         for _, i, pid in reversed(options):
-            if time() >= deadline:
+            if monotonic() >= deadline:
                 return
             old = rows[i]['plant_id']
             if prices[i][pid] >= prices[i][old]:
@@ -180,6 +181,8 @@ def eject(day, rows, changes, production, deadline, offer, seed):
                         if extra < saving and j_tid in allowed(j, alt):
                             proposals.append({i: base, j: move(j, alt, j_tid, 0)})
                 for proposal in proposals:
+                    if monotonic() >= deadline:
+                        return
                     trial = [proposal.get(j, row) for j, row in enumerate(rows)]
                     new_sim, result = replay(day, trial, changes, production)
                     if ranking(result) > ranking(current):
@@ -188,4 +191,75 @@ def eject(day, rows, changes, production, deadline, offer, seed):
                         break
                 else:
                     continue
+                break
+
+
+def tune_trucks(day, rows, changes, production, deadline, offer, seed):
+    """Reassign promising loads to nearby trucks to cut morning moves and waiting."""
+    rng = Random(seed)
+    sim, current = replay(day, rows, changes, production)
+    streams = [day.streams[r['stream_id']] for r in rows]
+    sites = [s['site_id'] for s in streams]
+    trucks_by_size = defaultdict(list)
+    for tid, truck in day.trucks.items():
+        trucks_by_size[truck['size']].append(tid)
+
+    def routes():
+        grouped = defaultdict(list)
+        actual = [sim.done[r['stream_id'], r['seq']] for r in rows]
+        for i, row in enumerate(rows):
+            grouped[row['truck_id']].append((row['load_start'], i))
+        for route in grouped.values():
+            route.sort()
+        repositioned = [i for i, trip in enumerate(actual) if trip['km_reposition']]
+        return grouped, actual, repositioned
+
+    grouped, actual, repositioned = routes()
+    while monotonic() < deadline:
+        if repositioned and rng.random() < 0.45:
+            i = rng.choice(repositioned)
+        else:
+            i = rng.randrange(len(rows))
+        row, trip = rows[i], actual[i]
+        pid = row['plant_id']
+        start = max(0, min(1439, round(trip['load_start']) + rng.choice((0, 0, -6, -3, -1, 1, 3, 6))))
+        ready_after = trip['pour_end'] + WASH_MIN + start - trip['load_start']
+        estimates = []
+        for tid in trucks_by_size[streams[i]['truck_size']]:
+            truck = day.trucks[tid]
+            if truck['allowed'] is not None and pid not in truck['allowed']:
+                continue
+            schedule = grouped.get(tid, ())
+            if tid == row['truck_id']:
+                schedule = [pair for pair in schedule if pair[1] != i]
+            pos = bisect_right(schedule, (start, i))
+            if pos:
+                previous = schedule[pos - 1][1]
+                origin, ready = sites[previous], actual[previous]['pour_end'] + WASH_MIN
+            else:
+                origin, ready = truck['home_plant'], TRUCK_DAY_START
+            km, travel = leg(day, origin, pid, ready)
+            cost = km if pos else km * day.cost['reposition_baht_per_km']
+            cost += 45 * max(0, ready + travel - start)
+            if pos < len(schedule):
+                following = schedule[pos][1]
+                next_plant = rows[following]['plant_id']
+                _, travel = leg(day, sites[i], next_plant, ready_after)
+                cost += 45 * max(0, ready_after + travel - actual[following]['load_start'])
+                if not pos:
+                    cost -= leg(day, origin, next_plant, ready)[0] * day.cost['reposition_baht_per_km']
+            estimates.append((cost, tid))
+        for tid in [t for _, t in sorted(estimates)[:3]] + [row['truck_id']]:
+            if monotonic() >= deadline:
+                return
+            replacement = dict(row, truck_id=tid, load_start=start)
+            if replacement == row:
+                continue
+            trial = rows[:]
+            trial[i] = replacement
+            new_sim, result = replay(day, trial, changes, production)
+            if ranking(result) > ranking(current):
+                sim, rows, current = new_sim, trial, result
+                grouped, actual, repositioned = routes()
+                offer(rows, changes, production, current)
                 break

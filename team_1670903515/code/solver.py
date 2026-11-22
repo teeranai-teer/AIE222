@@ -240,10 +240,10 @@ def optimize(day, budget=60.0, seed=1, log=None, co2_cap=None, strict=False, pat
     cur = build(st)
     best_o = obj(cur[3])
     best = (cur, {k: dict(v) for k, v in st.items()})
-    t0 = time.time()
+    t0 = time.monotonic()
     it = 0
     last_imp = 0
-    while time.time() - t0 < budget:
+    while time.monotonic() - t0 < budget:
         it += 1
         if patience and it - last_imp > patience and best[0][3]["sla_pass"]:
             break  # converged: SLA passes and no improvement for `patience` evaluations
@@ -283,7 +283,7 @@ def optimize(day, budget=60.0, seed=1, log=None, co2_cap=None, strict=False, pat
         o = obj(out[3])
         if o >= best_o:
             if o > best_o and log:
-                log(f"  it{it} {time.time()-t0:.0f}s sla={out[3]['sla_checks_passed']}/{out[3]['sla_checks_total']} contrib={out[3]['contribution_baht']:,}")
+                log(f"  it{it} {time.monotonic()-t0:.0f}s sla={out[3]['sla_checks_passed']}/{out[3]['sla_checks_total']} contrib={out[3]['contribution_baht']:,}")
             if o > best_o:
                 last_imp = it
             best_o, best = o, (out, cand)
@@ -330,7 +330,7 @@ def refine_plan(day, rows, changes, prod, deadline, seed=1, patience=6000, lam=N
         return cost_cache[k]
 
     n = last = 0
-    while time.time() < deadline and n - last <= patience:
+    while time.monotonic() < deadline and n - last <= patience:
         n += 1
         i = rnd.choice(focus) if (focus and rnd.random() < 0.7) else rnd.randrange(len(plan))
         r = plan[i]
@@ -422,7 +422,7 @@ def repair_build(day, changes, prod, deadline, max_iter=80):
         key = (res["sla_checks_passed"], res["sla_score"], res["contribution_baht"])
         if best is None or key > best[0]:
             best = (key, rows, res, ({k: v for k, v in buf.items()}, {k: v for k, v in bias.items()}))
-        if res["sla_pass"] or time.time() > deadline:
+        if res["sla_pass"] or time.monotonic() > deadline:
             break
         bad = {o["order_id"] for o in res["orders"] if o["colour"] != "GREEN" or not o["on_time"]}
         sim, _ = simulate(day, [dict(r) for r in rows], prod, changes)
@@ -449,16 +449,18 @@ def improve_shifts(day, start, prod, deadline, profit=False, bkw=None):
 
     cur_key, cur_res = run(chg)
     improved = True
-    while improved and time.time() < deadline and (profit or not cur_res["sla_pass"]):
+    while improved and time.monotonic() < deadline and (profit or not cur_res["sla_pass"]):
         improved = False
         bad = [o["order_id"] for o in cur_res["orders"] if o["colour"] != "GREEN" or not o["on_time"]]
         # failing orders first, then the orders sharing their plants' rush hour (all flexible orders)
         order = [o for o in bad if o in opts] + [o for o in opts if o not in bad]
         for oid in order:
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 break
             best = (cur_key, chg.get(oid), cur_res)
             for f in [None] + opts[oid]:
+                if time.monotonic() >= deadline:
+                    break
                 if f == chg.get(oid):
                     continue
                 trial = dict(chg)
@@ -503,7 +505,7 @@ def parallel_refine(day, rows, changes, prod, deadline, nproc=None, rounds=2, al
     try:
         ctx = mp.get_context(method)
         for rd in range(rounds):
-            now = time.time()
+            now = time.monotonic()
             end = now + (deadline - now) / (rounds - rd)
             q = ctx.Queue()
 
@@ -515,7 +517,7 @@ def parallel_refine(day, rows, changes, prod, deadline, nproc=None, rounds=2, al
             got = []
             for _ in procs:
                 try:
-                    got.append(q.get(timeout=max(1.0, end - time.time() + 4)))
+                    got.append(q.get(timeout=max(1.0, end - time.monotonic() + 4)))
                 except Exception:
                     break
             for p in procs:
@@ -528,7 +530,7 @@ def parallel_refine(day, rows, changes, prod, deadline, nproc=None, rounds=2, al
                     best_rows, best_res = plan, res
     except Exception:
         pass
-    if time.time() < deadline - 2:   # parallel stage failed/ended early: spend the rest serially
+    if time.monotonic() < deadline - 2:   # parallel stage failed/ended early: spend the rest serially
         try:
             p, _ = refine_plan(day, best_rows, changes, prod, deadline)
             r = evaluate_rows(day, p, prod, changes)
