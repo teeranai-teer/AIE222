@@ -1,11 +1,16 @@
 """Behaviour-identical speed-ups for the official simulator (memoised leg(), cheaper Line.earliest()).
 Only the solver imports this; results are bit-for-bit the same as the original functions."""
+from bisect import bisect_right
+
 import aiconcrete as _ac
 
 _orig_leg = _ac.leg
+_orig_earliest = _ac.Line.earliest
 
 
 def _leg(day, a, b, depart):
+    if a == b:
+        return 0.0, 0.0
     try:
         cache = day._legc
     except AttributeError:
@@ -18,22 +23,80 @@ def _leg(day, a, b, depart):
 
 
 def _earliest(self, a, length):
-    ivs = self.busy + self.blocks
-    t = a
-    for _ in range(500):
-        end = t + length
-        mx = None
-        for x, y in ivs:
-            if not (end <= x or t >= y) and (mx is None or y > mx):
-                mx = y
-        if mx is None:
-            return t
-        t = mx
-    return None
+    # Lines append reservations and blocks. Many preview calls query the same calendar.
+    sizes = (len(self.busy), len(self.blocks))
+    if length <= 0 or sum(sizes) >= 500:
+        return _orig_earliest(self, a, length)
+    calendar = getattr(self, '_calendar', None)
+    if calendar is None or calendar[0] != sizes:
+        starts, ends = [], []
+        for start, end in sorted(self.busy + self.blocks):
+            if start > end:
+                return _orig_earliest(self, a, length)
+            if ends and start <= ends[-1]:
+                ends[-1] = max(ends[-1], end)
+            else:
+                starts.append(start)
+                ends.append(end)
+        self._calendar = calendar = (sizes, starts, ends)
+    _, starts, ends = calendar
+    i = bisect_right(ends, a)
+    while i < len(starts) and a + length > starts[i]:
+        a = ends[i]
+        i += 1
+    return a
+
+
+def _line_start(self, pid, desired):
+    plant = self.day.plants[pid]
+    prep = plant['prep_min']
+    first = desired - prep
+    duration = prep + plant['mix_load_min']
+    best = None
+    for i, line in enumerate(self.lines[pid]):
+        start = line.earliest(first, duration)
+        if start is not None:
+            load = start + prep
+            if start == first:
+                return (load, i) if best is None or load < best[0] else best
+            if best is None or load < best[0]:
+                best = (load, i)
+    return best
+
+
+def eligible_trucks(day):
+    """Index vendors by station and truck size, in the original fleet order."""
+    cached = getattr(day, '_eligible_trucks', None)
+    if cached is None:
+        cached = {}
+        for tid, truck in day.trucks.items():
+            allowed = truck['allowed'] if truck['allowed'] is not None else day.plants
+            for pid in allowed:
+                cached.setdefault((pid, truck['size']), []).append(tid)
+        day._eligible_trucks = cached
+    return cached
+
+
+def _queue_violations(day, sim):
+    visits = {}
+    for (sid, _), trip in sim.done.items():
+        visits.setdefault(day.streams[sid]['site_id'], []).append((trip['arrive'], trip['pour_start']))
+    violations = 0
+    for site, trips in visits.items():
+        limit = day.sites[site]['max_queue']
+        waiting_trips = [(arrive, pour) for arrive, pour in trips if arrive < pour]
+        arrivals = sorted(arrive for arrive, _ in waiting_trips)
+        pours = sorted(pour for _, pour in waiting_trips)
+        for arrive, pour in trips:
+            waiting = bisect_right(arrivals, arrive) - bisect_right(pours, arrive)
+            violations += waiting - (arrive < pour) >= limit
+    return violations
 
 
 _ac.leg = _leg
 _ac.Line.earliest = _earliest
+_ac.Sim.line_start = _line_start
+_ac.queue_violations = _queue_violations
 
 
 # ---------------------------------------------------------------------------------------------

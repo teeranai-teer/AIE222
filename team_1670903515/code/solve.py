@@ -2,6 +2,7 @@
 import time
 
 T0 = time.monotonic()
+DEFAULT_SECONDS = 85
 MAX_SECONDS = 120
 
 import argparse
@@ -123,8 +124,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('day_dir')
     parser.add_argument('out_dir')
-    parser.add_argument('seconds', nargs='?', type=float, default=MAX_SECONDS,
-                        help=f'total time in seconds per day (maximum {MAX_SECONDS})')
+    parser.add_argument('seconds', nargs='?', type=float, default=DEFAULT_SECONDS,
+                        help=f'total time in seconds per day (default {DEFAULT_SECONDS}, maximum {MAX_SECONDS})')
     parser.add_argument('--warm-start', metavar='PLAN_DIR')
     parser.add_argument('--seed', type=int, help='search seed (default: 37 on holidays, 15 otherwise)')
     args = parser.parse_args()

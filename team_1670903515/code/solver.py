@@ -48,6 +48,7 @@ class Builder:
         self.bias = bias or {}
         self.K = trucks_k
         self.wait_w = wait_w
+        self.eligible = fastsim.eligible_trucks(day)
         self.plants_for = {}
         for sid, s in day.streams.items():
             self.plants_for[sid] = [p for p in day.plants if (p, s["product_id"]) in day.plant_product]
@@ -61,8 +62,12 @@ class Builder:
         site = d.sites[s["site_id"]]
         _, m = leg(d, pid, s["site_id"], target - 40)
         planned = target - m - site["access_min"] - p["mix_load_min"] - p["qc_min"]
+        last_planned = None
         for _ in range(4):
             pl = max(floor, int(math.floor(planned)))
+            if pl == last_planned:
+                break
+            last_planned = pl
             r = sim.preview(sid, k, pid, tid, pl)
             err = target - r["arrive"]
             if best is None or abs(err) < abs(best[1]):
@@ -91,7 +96,7 @@ class Builder:
 
         for sid in d.streams:
             push(sid)
-        rows, results = [], {}
+        rows = []
         while heap:
             target, sid, k = heapq.heappop(heap)
             s = d.streams[sid]
@@ -99,7 +104,13 @@ class Builder:
             best = None
             floor = st["prev_planned"]
             for pid in self.plants_for[sid]:
+                seen_states = set()
                 for tid in self.pick_trucks(sim, sid, pid, target):
+                    truck = sim.trucks[tid]
+                    state_key = truck.loc, truck.ready
+                    if state_key in seen_states:
+                        continue
+                    seen_states.add(state_key)
                     r = self.solve_planned(sim, sid, k, pid, tid, target, floor)
                     sc = self.score(sim, r, s, target, k) + self.bias.get((sid, pid), 0)
                     if best is None or sc < best[0]:
@@ -130,9 +141,7 @@ class Builder:
         _, m = leg(d, pid, s["site_id"], target - 40)
         need = target - m - site["access_min"] - p["mix_load_min"] - p["qc_min"]
         feas, late = [], []
-        for tid, t in d.trucks.items():
-            if t["size"] != s["truck_size"] or (t["allowed"] is not None and pid not in t["allowed"]):
-                continue
+        for tid in self.eligible.get((pid, s["truck_size"]), ()):
             ts = sim.trucks[tid]
             if ts.loc == pid:
                 ready, repo = ts.ready, 0.0

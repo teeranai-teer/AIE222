@@ -5,6 +5,7 @@ from heapq import heappop, heappush
 from itertools import count
 from math import ceil, floor
 
+from fastsim import eligible_trucks
 from aiconcrete import GRADES, Sim, TRUCK_DAY_START, WASH_MIN, leg, transport_cost
 
 
@@ -13,10 +14,8 @@ def dispatch(day, changes, production, *, first_slack=3, tightness=0.60,
              shift_penalty=1.0, wait_weight=1.0, pace=0, fixed=(), only=None):
     sim = Sim(day, production, changes)
     costs = day.cost
-    by_plant_size = defaultdict(list)
-    for tid, truck in day.trucks.items():
-        for pid in sorted(truck['allowed'] or day.plants):
-            by_plant_size[pid, truck['size']].append(tid)
+    by_plant_size = eligible_trucks(day)
+    reposition_rate = costs['reposition_baht_per_km']
     plans = {tid: [] for tid in day.trucks}
     starts = {tid: [] for tid in day.trucks}
     available = {}
@@ -34,7 +33,7 @@ def dispatch(day, changes, production, *, first_slack=3, tightness=0.60,
         volume = s['load_m3']
         candidates = []
         for pid, plant in day.plants.items():
-            if (pid, s['product_id']) not in day.plant_product or not by_plant_size[pid, s['truck_size']]:
+            if (pid, s['product_id']) not in day.plant_product or (pid, s['truck_size']) not in by_plant_size:
                 continue
             if any(st['plant_id'] == pid and st['lines'] == 0 and st['start'] <= plant['open_m']
                    and st['end'] >= plant['close_m'] for st in day.status):
@@ -88,6 +87,9 @@ def dispatch(day, changes, production, *, first_slack=3, tightness=0.60,
         earliest = original + customer['site_delay_min'] if seq == 1 else sim.site_free[sid]
         pour_time = s['interval_min'] * customer['pour_factor']
         following = fixed_by_seq.get((sid, seq + 1))
+        gap = s['max_gap_min']
+        life = day.products[s['product_id']]['concrete_life_min']
+        access = site['access_min']
         best = None
         for spend, pid, lead in available[sid]:
             if best is not None and spend > best[0] + 600:
@@ -97,73 +99,82 @@ def dispatch(day, changes, production, *, first_slack=3, tightness=0.60,
             last_slot = plant['close_m'] - plant['mix_load_min']
             target = ideal - lead
             for _ in range(3):
-                target = ideal - offset - site['access_min'] - leg(day, pid, site_id, target + offset)[1]
+                target = ideal - offset - access - leg(day, pid, site_id, target + offset)[1]
             target = floor(target)
+            slots, pours, predecessors, examined = {}, {}, {}, set()
+
+            def next_slot(desired):
+                if desired not in slots:
+                    slot = sim.line_start(pid, desired)
+                    slots[desired] = ceil(slot[0] - 1e-8) if slot is not None else last_slot + 1
+                return slots[desired]
+
             starts_to_try = {max(last_time[sid], target + d) for d in (-7, -2, 0, 2, 6)}
             for planned in sorted(starts_to_try):
                 if planned > last_slot:
                     continue
-                slot = sim.line_start(pid, planned)
-                if slot is None:
+                low = next_slot(planned)
+                if low > last_slot or low in examined:
                     continue
-                low = ceil(slot[0] - 1e-8)
-                if low > last_slot:
-                    continue
+                examined.add(low)
                 for tid in by_plant_size[pid, s['truck_size']]:
-                    ts = day.trucks[tid]
                     times, route = starts[tid], plans[tid]
                     index = bisect_right(times, low)
-                    if index:
-                        prev = route[index - 1]
-                        location, ready = day.streams[prev['stream_id']]['site_id'], prev['pour_end'] + WASH_MIN
-                    else:
-                        location, ready = ts['home_plant'], TRUCK_DAY_START
-                    km, travel = leg(day, location, pid, ready)
-                    first_cost = km * costs['reposition_baht_per_km'] if not index else 0
-                    if index == 0 and route:
-                        first_cost -= leg(day, location, route[0]['plant_id'], ready)[0] * costs['reposition_baht_per_km']
-                    cost_floor = spend + first_cost * reuse_weight + empty_weight * km
+                    predecessor = tid, index
+                    if predecessor not in predecessors:
+                        if index:
+                            prev = route[index - 1]
+                            location, ready = day.streams[prev['stream_id']]['site_id'], prev['pour_end'] + WASH_MIN
+                        else:
+                            location, ready = day.trucks[tid]['home_plant'], TRUCK_DAY_START
+                        km, travel = leg(day, location, pid, ready)
+                        first_cost = km * reposition_rate if not index else 0
+                        if index == 0 and route:
+                            first_cost -= leg(day, location, route[0]['plant_id'], ready)[0] * reposition_rate
+                        cost_floor = spend + first_cost * reuse_weight + empty_weight * km
+                        predecessors[predecessor] = (location, ready, cost_floor, ceil(ready + travel - 1e-8))
+                    location, ready, cost_floor, arrival_at_plant = predecessors[predecessor]
                     if best is not None and cost_floor >= best[0]:
                         continue
-                    actual = max(low, ceil(ready + travel - 1e-8))
+                    actual = max(low, arrival_at_plant)
                     if actual != low:
-                        if best is not None and actual > target + 35 + s['max_gap_min']:
+                        if best is not None and actual > target + 35 + gap:
                             continue
-                        slot = sim.line_start(pid, actual)
-                        if slot is None:
-                            continue
-                        actual = ceil(slot[0] - 1e-8)
+                        actual = next_slot(actual)
                     if actual > last_slot or index < len(times) and actual >= times[index]:
                         continue
                     if following and actual > following[0]['load_start']:
                         continue
-                    arrive = actual + offset + leg(day, pid, site_id, actual + offset)[1] + site['access_min']
-                    stop = 0
-                    for start, end in site['no_entry']:
-                        if start <= arrive < end:
-                            stop = end - arrive
-                            arrive = end
-                    begin = max(earliest, arrive)
-                    end = begin + pour_time
-                    if end - actual > day.products[s['product_id']]['concrete_life_min']:
+                    if actual not in pours:
+                        arrive = actual + offset + leg(day, pid, site_id, actual + offset)[1] + access
+                        stop = 0
+                        for start, end in site['no_entry']:
+                            if start <= arrive < end:
+                                stop = end - arrive
+                                arrive = end
+                        begin = max(earliest, arrive)
+                        end = begin + pour_time
+                        wait_cost = (begin - arrive + stop) * costs['truck_wait_baht_per_min'] * wait_weight
+                        if seq == 1:
+                            violation = max(0, abs(arrive - original) - 14.7)
+                            rhythm = max(0, begin - earliest - 6) * 0.3
+                        else:
+                            violation = max(0, begin - earliest - gap + 0.3)
+                            rhythm = max(0, begin - earliest - gap * max(tightness, pace))
+                        if following:
+                            next_trip = following[1]
+                            violation += max(0, next_trip['arrive'] - end - max(gap, next_trip['gap'] or 0))
+                            violation += max(0, end - next_trip['pour_start'] - 1)
+                        pours[actual] = (end, wait_cost, 500 * violation, 7 * rhythm * shift_penalty)
+                    end, wait_cost, violation_cost, rhythm_cost = pours[actual]
+                    if end - actual > life:
                         continue
                     if index < len(route):
                         ready_after = end + WASH_MIN
                         time_to_next = leg(day, site_id, route[index]['plant_id'], ready_after)[1]
                         if ready_after + time_to_next > times[index] + 1e-8:
                             continue
-                    wait_cost = (begin - arrive + stop) * costs['truck_wait_baht_per_min'] * wait_weight
-                    if seq == 1:
-                        violation = max(0, abs(arrive - original) - 14.7)
-                        rhythm = max(0, begin - earliest - 6) * 0.3
-                    else:
-                        violation = max(0, begin - earliest - s['max_gap_min'] + 0.3)
-                        rhythm = max(0, begin - earliest - s['max_gap_min'] * max(tightness, pace))
-                    if following:
-                        next_trip = following[1]
-                        violation += max(0, next_trip['arrive'] - end - max(s['max_gap_min'], next_trip['gap'] or 0))
-                        violation += max(0, end - next_trip['pour_start'] - 1)
-                    rank = cost_floor + wait_cost + 500 * violation + 7 * rhythm * shift_penalty
+                    rank = cost_floor + wait_cost + violation_cost + rhythm_cost
                     if best is None or rank < best[0]:
                         best = (rank, pid, tid, actual, index, location, ready)
         if best is None:
